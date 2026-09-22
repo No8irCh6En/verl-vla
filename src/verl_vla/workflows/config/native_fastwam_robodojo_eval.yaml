@@ -1,0 +1,60 @@
+# One process, one native Fast-WAM replica, one vectorized RoboDojo backend.
+# The simulator and model may share one GPU (both 0) or use two GPUs (0/1).
+model_root: ???
+# Optional SHA already verified for this exact weight file. Supplying it avoids
+# hashing a ~12 GB checkpoint at every short evaluation launch.
+checkpoint_sha256: null
+# Optional full verl actor/global_step directory. When set, its trained MoT and
+# proprio weights are applied in memory after loading model_root; no native
+# checkpoint file is written.
+verl_actor_checkpoint: null
+policy_root: ???
+robodojo_root: ???
+task_name: stack_bowls
+task_id: 0
+env_cfg_type: arx_x5
+
+# Fixed paired cases. Repeat each environment/layout id with distinct policy seeds.
+layout_ids: [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]
+policy_seeds: [1000, 1001, 1002, 1003, 1000, 1001, 1002, 1003, 1000, 1001, 1002, 1003]
+allow_held_out_eval_layouts: false
+
+# The simulator vector and policy inference microbatch are independent knobs.
+# Increasing num_envs does not load another model. Lower the microbatch only if
+# Fast-WAM inference activations plus Isaac exceed GPU memory.
+num_envs: 4
+policy_microbatch_size: 4
+# Number of independent RoboDojo simulator processes sharing the one model
+# replica.  ``1`` keeps the original single-process evaluator.  Values above
+# one require num_envs to divide evenly and are intended for packed layouts,
+# e.g. num_envs=18, simulator_shards=3 gives three concurrent vec6 simulators.
+simulator_shards: 1
+reset_max_attempts: 10
+simulator_device_id: 0
+model_device_id: 0
+max_policy_calls: 34
+# `terminal` matches RoboDojo's final episode score. `trajectory_max` is kept
+# only to finish already-started paired matrices created with the historical
+# evaluator without mixing score semantics across shards. Binary success is
+# identical in both modes.
+process_score_reduction: terminal
+
+num_inference_steps: 10
+rollout_action_latent_scale: 1.0
+rollout_seed_mode: episode
+sigma_shift: null
+seed: 0
+text_cfg_scale: 1.0
+negative_prompt: ""
+rand_device: cpu
+tiled: false
+sim_cfg_name: sim_robotwin.yaml
+sim_task: robotwin_uncond_3cam_384_1e-4
+
+headless: true
+record_video: true
+video_fps: 30
+# Optional diagnostic capture. When set, save only the first policy-call
+# observation/action of each wave; null keeps normal evaluation I/O unchanged.
+first_call_capture_dir: null
+output_dir: outputs/native_fastwam_robodojo_eval

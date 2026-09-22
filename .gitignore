@@ -32,6 +32,15 @@ eggs/
 .eggs/
 lib/
 lib64/
+# Public launchers depend on these repository runtime helpers. Keep other
+# generated or local `lib/` directories ignored.
+!/scripts/lib/
+/scripts/lib/*
+!/scripts/lib/check_runtime.py
+!/scripts/lib/runtime_env.sh
+!/scripts/lib/runtime_site/
+/scripts/lib/runtime_site/*
+!/scripts/lib/runtime_site/sitecustomize.py
 parts/
 sdist/
 var/
@@ -96,6 +105,10 @@ celerybeat-schedule
 # dotenv
 .env
 
+# Machine-local runtime contracts. Only the portable template is published.
+/configs/site/*.env.sh
+!/configs/site/example.env.sh
+
 # virtualenv
 venv/
 .venv/
@@ -125,6 +138,36 @@ ENV/
 # data
 .data/
 *.parquet
+
+# Local datasets and model artifacts
+/data/
+/datasets/
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+*.pth
+*.safetensors
+*.onnx
+*.zip
+
+# Generated media
+*.avi
+*.mov
+*.mp4
+*.webm
+
+# Local experiment state and reports
+/progress/
+/analysis/
+/docs/progress/
+.hydra/
+multirun/
+ray_results/
+session_latest
+slurm-*.out
+*.pid
 
 
 # local logs

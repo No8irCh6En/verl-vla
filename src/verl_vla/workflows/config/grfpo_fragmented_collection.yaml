@@ -1,0 +1,98 @@
+# One GPU, one Fast-WAM replica, one complete G=8 same-condition candidate.
+collection_root: ${oc.env:GRFPO_COLLECTION_ROOT,???}
+run_id: grfpo-multitask5
+intended_update: 1
+rollout_policy_version: 0
+collector_slot: ${oc.env:SLURM_ARRAY_TASK_ID,0}
+collector_count: 15
+run_seed: 7865
+# Optional stable namespace for paired algorithm ablations. Leaving this empty
+# preserves the historical behavior of deriving policy seeds from run_id.
+policy_seed_namespace: ""
+
+# The shared queue is enabled by the production launcher for new windows. Each
+# warm process keeps one task/suite affinity; after draining it, the enclosing
+# Slurm allocation restarts the process in cross-condition stealing mode.
+shared_candidate_queue: ${oc.decode:${oc.env:GRFPO_SHARED_CANDIDATE_QUEUE,0}}
+shared_queue_steal_any: ${oc.decode:${oc.env:GRFPO_SHARED_QUEUE_STEAL_ANY,0}}
+candidate_lease_timeout_seconds: 900
+candidate_lease_heartbeat_seconds: 30
+shared_queue_idle_poll_seconds: 10
+
+# One keeps the established one-model/one-vec8 collector. Two enables the
+# shared-model topology: one Fast-WAM parent serves two independent vec8
+# RoboDojo processes on the same GPU (16 concurrent trajectories, but still
+# two separately validated/committed G=8 groups). This remains opt-in until a
+# one-GPU parity/throughput smoke has passed for the target cluster.
+simulators_per_gpu: ${oc.decode:${oc.env:GRFPO_SIMULATORS_PER_GPU,1}}
+shared_simulator_startup_stagger_seconds: ${oc.decode:${oc.env:GRFPO_SHARED_SIMULATOR_STARTUP_STAGGER_SECONDS,8}}
+shared_inference_coalesce_ms: ${oc.decode:${oc.env:GRFPO_SHARED_INFERENCE_COALESCE_MS,5}}
+
+group_size: 8
+# Zero preserves the normal one-wave vec8 path.  A smaller divisor is an
+# infrastructure fallback for a condition that cannot stably reset all eight
+# simulator slots at once; the logical GRPO group remains G=8 and is assembled
+# from sequential same-condition waves before validation/commit.
+physical_rollout_batch_size: ${oc.decode:${oc.env:GRFPO_PHYSICAL_ROLLOUT_BATCH_SIZE,0}}
+target_accepted_groups: 32
+minimum_accepted_groups: 32
+max_candidate_groups: 96
+# Off by default so already-open legacy windows retain their exact M-target
+# closing rule when a preempted collector reloads this configuration. New
+# launches enable round-balanced closing explicitly through Slurm exports.
+complete_round_after_target: ${oc.decode:${oc.env:GRFPO_COMPLETE_ROUND_AFTER_TARGET,0}}
+drain_candidate_budget: ${oc.decode:${oc.env:GRFPO_DRAIN_CANDIDATE_BUDGET,1}}
+round_barrier_poll_seconds: 5
+task_names:
+  - stack_bowls
+  - fold_clothes
+  - put_bottles_into_dustbin
+  - match_and_pick_from_conveyor
+  - classify_objects
+included_task_names: ${oc.env:GRFPO_INCLUDED_TASK_NAMES,""}
+excluded_task_names: ${oc.env:GRFPO_EXCLUDED_TASK_NAMES,""}
+suite_ids: [0, 1, 2]
+condition_manifest: ${oc.env:VVLA_CONDITION_MANIFEST,???}
+condition_manifest_sha256: 000c042d4528dd14fbbcf9c1c5c99a0ed19e1a727f440a1f88baafd223c43e56
+
+group_reward_source: binary_success
+informative_group_criterion: full_success_mixed
+accepted_group_reduction: ${oc.env:GRFPO_ACCEPTED_GROUP_REDUCTION,group_equal}
+min_partial_trajectories_for_score_only_group: 1
+partial_score_threshold: 0.15
+
+model_root: ???
+checkpoint_sha256: ???
+verl_actor_checkpoint: null
+policy_root: ${oc.env:FASTWAM_POLICY_ROOT,???}
+robodojo_root: ${oc.env:ROBODOJO_ROOT,???}
+env_cfg_type: arx_x5
+
+num_inference_steps: 10
+rollout_action_latent_scale: 1.0
+rollout_seed_mode: episode
+sigma_shift: null
+seed: 0
+text_cfg_scale: 1.0
+negative_prompt: ""
+rand_device: cpu
+tiled: false
+sim_cfg_name: sim_robotwin.yaml
+sim_task: robotwin_uncond_3cam_384_1e-4
+
+policy_microbatch_size: 4
+simulator_device_id: 0
+model_device_id: 0
+max_policy_calls: 34
+reset_max_attempts: 8
+# Joint-space state is normally O(1). A candidate exceeding this deliberately
+# loose bound is not committed; the collector exits so a fresh simulator can
+# retry the same predeclared candidate under the same theta_old.
+raw_state_abs_limit: 100.0
+# Method-specific rollout payload.  Both methods share the same durable queue,
+# group validation, anomaly rejection, reward, and task-reduction contract.
+# Only Flow-GRPO records an SDE transition trace during behavior rollout.
+actor_objective: ${oc.env:GRFPO_ACTOR_OBJECTIVE,fpo}
+flow_grpo_noise_level: ${oc.decode:${oc.env:GRFPO_FLOW_GRPO_NOISE_LEVEL,0.01}}
+flow_grpo_transition_batch_size: ${oc.decode:${oc.env:GRFPO_FLOW_GRPO_TRANSITION_BATCH_SIZE,3}}
+headless: true

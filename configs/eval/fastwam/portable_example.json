@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "name": "portable_fastwam_robodojo_eval",
+  "purpose": "portable_smoke",
+  "description": "Copy this spec and replace policy paths, checksum, checkpoint step, and desired conditions.",
+  "attempts_per_item": 3,
+  "repeats": 1,
+  "policies": [
+    {
+      "label": "theta1",
+      "model_root": "/path/to/exported-fastwam-sft-model",
+      "checkpoint_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "verl_actor_checkpoint": "/path/to/grfpo/checkpoints/global_step_1",
+      "expected_source_verl_global_step": 1
+    }
+  ],
+  "targets": [
+    {
+      "task_name": "stack_bowls",
+      "task_id": 0,
+      "suite_id": 0,
+      "layout_id": 0,
+      "policy_seeds": [70000, 70001, 70002, 70003, 70004, 70005]
+    }
+  ],
+  "topology": {
+    "num_envs": 6,
+    "policy_microbatch_size": 2,
+    "full_observation": true,
+    "record_video": true,
+    "max_policy_calls": 34,
+    "reset_max_attempts": 10,
+    "process_score_reduction": "terminal"
+  }
+}
