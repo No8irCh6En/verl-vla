@@ -31,7 +31,15 @@ from verl.workers.config import HFModelConfig, TrainingWorkerConfig
 from verl.workers.engine_workers import ActorRolloutRefWorker
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
 
-from verl_vla.workers.config import ActorConfig, ActorDataKeysConfig, FPOActorConfig, RolloutConfig, SFTActorConfig
+from verl_vla.workers.config import (
+    ActorConfig,
+    ActorDataKeysConfig,
+    FlowGRPOActorConfig,
+    FPOActorConfig,
+    RolloutConfig,
+    SFTActorConfig,
+)
+from verl_vla.workers.engine.flow_grpo import FlowGRPOTrainingWorker
 from verl_vla.workers.engine.fpo import FPOTrainingWorker
 from verl_vla.workers.engine.sac import SACTrainingWorker
 from verl_vla.workers.engine.sft import SFTTrainingWorker
@@ -48,6 +56,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 ACTOR_WORKER_REGISTRY = {
     "verl_vla.workers.config.ActorConfig": (ActorConfig, SACTrainingWorker),
     "verl_vla.workers.config.FPOActorConfig": (FPOActorConfig, FPOTrainingWorker),
+    "verl_vla.workers.config.FlowGRPOActorConfig": (FlowGRPOActorConfig, FlowGRPOTrainingWorker),
     "verl_vla.workers.config.SFTActorConfig": (SFTActorConfig, SFTTrainingWorker),
 }
 
@@ -220,6 +229,18 @@ class VLAActorRolloutRefWorker(ActorRolloutRefWorker):
         return output.to("cpu") if output is not None else None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    def diagnose_fpo_task_gradients(self, data: DataProto) -> DataProto:
+        """Run an explicit read-only fixed-MC GRFPO gradient replay."""
+
+        assert self._is_actor
+        if not isinstance(self.actor, FPOTrainingWorker):
+            raise RuntimeError("Task-gradient replay requires the FPO training worker.")
+        self.actor._ensure_fpo_initialized()
+        with self.actor.engine.train_mode():
+            diagnostics = self.actor.diagnose_task_gradients(data)
+        return DataProto(meta_info={"task_gradient_diagnostics": diagnostics})
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def add_offline_replay_data(self, data: DataProto) -> DataProto:
         assert self._is_actor
         data.meta_info["add_to_offline_replay_only"] = True
@@ -235,6 +256,14 @@ class VLAActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def switch_to_train(self):
         self._require_fsdp_rollout_engine().switch_to_train()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def export_portable_checkpoint(self, local_path: str):
+        """Export the actor checkpoint for a later FSDP world-size change."""
+
+        if not self._is_actor or self.actor is None:
+            raise RuntimeError("Portable checkpoint export requires an actor worker.")
+        return self.actor.engine.checkpoint_manager.export_portable_checkpoint(local_path)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"), blocking=False)
     def generate_sequences(self, prompts: DataProto) -> DataProto:

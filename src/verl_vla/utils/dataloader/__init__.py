@@ -13,6 +13,17 @@
 # limitations under the License.
 
 from .config import LeRobotDataLoaderConfig
-from .lerobot import build_lerobot_sft_dataloader, resolve_multiprocessing_context
 
 __all__ = ["LeRobotDataLoaderConfig", "build_lerobot_sft_dataloader", "resolve_multiprocessing_context"]
+
+
+def __getattr__(name: str):
+    """Load LeRobot/video dependencies only when a dataloader is requested."""
+    if name in {"build_lerobot_sft_dataloader", "resolve_multiprocessing_context"}:
+        from .lerobot import build_lerobot_sft_dataloader, resolve_multiprocessing_context
+
+        return {
+            "build_lerobot_sft_dataloader": build_lerobot_sft_dataloader,
+            "resolve_multiprocessing_context": resolve_multiprocessing_context,
+        }[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

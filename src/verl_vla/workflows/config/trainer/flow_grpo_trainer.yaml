@@ -1,0 +1,10 @@
+defaults:
+  - fpo_trainer
+  - _self_
+
+_target_: verl_vla.trainer.flow_grpo.config.FlowGRPOTrainerConfig
+project_name: vla-flow-grpo
+advantage_estimator: grpo_outcome
+group_size: 8
+informative_group_sampling: true
+async_rollout: false

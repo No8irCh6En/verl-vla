@@ -24,7 +24,7 @@ from verl import DataProto
 from verl.base_config import BaseConfig
 from verl.protocol import pad_dataproto_to_divisor
 
-from verl_vla.utils.dataloader import LeRobotDataLoaderConfig
+from verl_vla.utils.dataloader.config import LeRobotDataLoaderConfig
 
 
 @dataclass

@@ -1,0 +1,154 @@
+# @package _global_
+# One actor-only update over a closed fragmented collection window.
+defaults:
+  - /cluster@_global_.cluster: actor_cluster
+  - /trainer@_global_.trainer: grfpo_trainer
+  - /ray@_global_.ray_kwargs: default
+  - override /actor@_global_.cluster.actor_rollout_ref.actor: grfpo_actor
+  - override /model/adapter@_global_.cluster.actor_rollout_ref.model.adapter: fastwam
+  - _self_
+
+output_dir: ${oc.env:GRFPO_OUTPUT_ROOT,???}
+
+# Infrastructure-only gate used to validate a different FSDP world size.  It
+# loads the exact theta_old model/optimizer/RNG checkpoint and exits before
+# reading rollout data or taking an optimizer step.
+checkpoint_load_smoke_only: false
+checkpoint_portable_export_only: false
+# Explicit read-only research diagnostic. It reuses one fixed set of CFM MC
+# samples across task/group branches, never calls optimizer.step, and currently
+# requires one actor GPU because rank-local FSDP norms are not global norms.
+task_gradient_diagnostic_only: false
+task_gradient_diagnostic_output: null
+# Optional label -> full world-size-one actor-state JSON.  When supplied, the
+# read-only replay also reports exact trainable-parameter displacement,
+# g_task dot delta_theta, and fixed-old/advantage/MC surrogate loss after each
+# target update.  Group-by-group backward is opt-in for this causal path.
+task_gradient_diagnostic_targets_json: null
+task_gradient_diagnostic_include_groups: true
+# Optional receipt outside the immutable source collection window. This is
+# used only by read-only counterfactual replays of an already-trained batch.
+counterfactual_replay_receipt_path: null
+
+collection:
+  collection_root: ${oc.env:GRFPO_COLLECTION_ROOT,???}
+  run_id: grfpo-multitask5
+  intended_update: 1
+  rollout_policy_version: 0
+  # These fields are overridden from the immutable collection-window manifest
+  # by run_spooled_update.sh.  Keep them in the structured Hydra schema so a
+  # closed multi-task window can be reconstructed and identity-checked before
+  # any optimizer work starts.
+  task_names:
+    - stack_bowls
+    - fold_clothes
+    - put_bottles_into_dustbin
+    - match_and_pick_from_conveyor
+    - classify_objects
+  included_task_names: ""
+  excluded_task_names: ""
+  suite_ids: [0, 1, 2]
+  condition_manifest_sha256: ???
+  group_reward_source: binary_success
+  informative_group_criterion: full_success_mixed
+  accepted_group_reduction: group_equal
+  policy_seed_namespace: ""
+  collector_count: 15
+  group_size: 8
+  target_accepted_groups: 32
+  minimum_accepted_groups: 16
+  max_candidate_groups: 96
+  complete_round_after_target: false
+  drain_candidate_budget: false
+  # Pin the method identity in every durable window. The shared submitter
+  # passes these fields for both FPO and Flow-GRPO and the trainer rejects a
+  # method-mismatched spool before loading rollout tensors.
+  actor_objective: fpo
+  flow_grpo_noise_level: 0.01
+  model_root: ???
+  checkpoint_sha256: ???
+  verl_actor_checkpoint: null
+
+cluster:
+  actor_rollout_ref:
+    model:
+      path: ${collection.model_root}
+      tokenizer_path: null
+      load_tokenizer: false
+      native_architecture: fastwam
+      adapter:
+        policy_root: ${oc.env:FASTWAM_POLICY_ROOT,???}
+        checkpoint_sha256: ${collection.checkpoint_sha256}
+        fpo:
+          enabled: true
+          value_enabled: false
+    actor:
+      mini_batch_size: 8704
+      micro_batch_size: 1
+      full_logical_batch_gradient_accumulation: true
+      update_epochs: 2
+      n_action_samples: 4
+      fpo_variant: fpo_plus_plus
+      trust_region_mode: ppo
+      cfm_loss_kernel: huber
+      huber_delta: 1.0
+      log_ratio_clamp: 5.0
+      clip_coef: 0.01
+      vf_coef: 0.0
+      normalize_advantages: false
+      value_only_updates: 0
+      target_kl: 0.1
+      kl_early_stop_mode: post_epoch
+      fpo_mc_seed: null
+      fpo_shuffle_seed: null
+      post_resume_lr_override: null
+      # Fast-WAM has no HuggingFace save_pretrained() artifact. The sharded
+      # model/optimizer/extra payload is the canonical resumable checkpoint;
+      # requesting hf_model would fail only after the expensive update ended.
+      checkpoint:
+        save_contents: ["model", "optimizer", "extra"]
+        load_contents: ["model", "optimizer", "extra"]
+      optim:
+        lr: 1.0e-5
+        betas: [0.9, 0.99]
+        weight_decay: 0.0
+        clip_grad: 25.0
+        lr_scheduler_type: constant
+      value:
+        enabled: false
+        lr: 1.0e-4
+        weight_decay: 0.0
+        clip_grad: 25.0
+  resource:
+    model:
+      nnodes: 1
+      gpus_per_node: 1
+      workers_per_node: 1
+      device: cuda
+  checkpoint:
+    # theta0: use disable. Later updates: set resume_path and point
+    # resume_from_path at the exact theta_old global_step directory.
+    resume_mode: disable
+    resume_from_path: null
+    default_local_dir: ${output_dir}/checkpoints
+    max_actor_ckpt_to_keep: 8
+
+trainer:
+  total_training_steps: 1
+  group_size: 8
+  accepted_groups_per_update: ${collection.target_accepted_groups}
+  min_accepted_groups_for_partial_update: ${collection.minimum_accepted_groups}
+  max_candidate_groups_per_update: ${collection.max_candidate_groups}
+  concurrent_candidate_groups: 1
+  informative_group_sampling: true
+  advantage_estimator: grpo_outcome
+  group_reward_source: ${collection.group_reward_source}
+  informative_group_criterion: ${collection.informative_group_criterion}
+  accepted_group_reduction: ${collection.accepted_group_reduction}
+  save_freq: 1
+  test_freq: 0
+  val_before_train: false
+
+ray_kwargs:
+  ray_init:
+    _temp_dir: /tmp/verl-vla-grfpo-spooled-ray

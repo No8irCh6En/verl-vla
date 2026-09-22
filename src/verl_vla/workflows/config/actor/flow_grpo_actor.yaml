@@ -1,0 +1,28 @@
+defaults:
+  - fpo_actor
+  - _self_
+
+_target_: verl_vla.workers.config.FlowGRPOActorConfig
+
+# The advantage is normalized once within each same-condition G=8 group.
+normalize_advantages: false
+vf_coef: 0.0
+value_only_updates: 0
+full_logical_batch_gradient_accumulation: true
+
+# Match the official implementation's int(T * fraction) transition subset.
+train_transition_fraction: 0.99
+
+# Official Flow-GRPO clamps group advantages before the clipped surrogate.
+advantage_clip_max: 5.0
+
+# Pass 1 materializes and updates from theta_old; pass 2 evaluates and clips
+# against that same frozen reference after theta has changed.
+update_epochs: 2
+
+# Per-microbatch CUDA synchronization is useful for one-off profiling but
+# needlessly serializes production runs containing thousands of chunks.
+profile_cuda_sync_timing: false
+
+value:
+  enabled: false

@@ -49,12 +49,26 @@ class EnvLoopConfig(BaseConfig):
 
     pipeline_stage_num: int = 2
     max_interactions: int = 8
+    # Keep actor inference at one worker-local vector batch even when one
+    # pipeline stage aggregates several EnvWorker ranks. This lets each
+    # (stage, worker) cell be one complete GRPO group without turning a
+    # four-group collection wave into a single B=32 Fast-WAM forward.
+    rollout_partition_by_env_worker: bool = False
+    # Optionally split each worker-local vector further into fixed-size actor
+    # requests.  A value of 8 permits one vector16/vector24 RoboDojo process to
+    # carry two/three G=8 groups while keeping Fast-WAM inference at B=8.
+    rollout_partition_size: int = 0
 
     def __post_init__(self):
         if self.pipeline_stage_num <= 0:
             raise ValueError(f"pipeline_stage_num must be positive, got {self.pipeline_stage_num}")
         if self.max_interactions <= 0:
             raise ValueError(f"max_interactions must be positive, got {self.max_interactions}")
+        if self.rollout_partition_size < 0:
+            raise ValueError(
+                "rollout_partition_size must be non-negative, "
+                f"got {self.rollout_partition_size}"
+            )
 
 
 @dataclass

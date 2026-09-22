@@ -76,6 +76,7 @@ class VLAModelConfig(HFModelConfig):
     )
 
     def __post_init__(self):
+        requested_native_architecture = self.native_architecture
         # Adapt the canonical nested VLA config to verl's flat FSDP LoRA contract.
         self.lora_rank = int(self.lora["rank"])
         self.lora_alpha = int(self.lora["alpha"])
@@ -101,7 +102,9 @@ class VLAModelConfig(HFModelConfig):
         policy_type = str(checkpoint_config.get("type", ""))
         architectures = " ".join(checkpoint_config.get("architectures", []))
         identity = f"{class_name} {model_type} {architectures}".lower()
-        if class_name == "PI0Policy":
+        if requested_native_architecture is not None:
+            architecture = str(requested_native_architecture)
+        elif class_name == "PI0Policy":
             architecture = "pi0"
         elif model_type == "openvla":
             architecture = "openvla_oft"

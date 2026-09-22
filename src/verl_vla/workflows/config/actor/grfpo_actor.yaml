@@ -21,6 +21,10 @@ _target_: verl_vla.workers.config.FPOActorConfig
 # Global number of action chunks in each FPO mini-batch.
 mini_batch_size: 128
 
+# If true, the complete (possibly partial) logical rollout batch is one optimizer
+# minibatch and is physically streamed through micro_batch_size accumulation.
+full_logical_batch_gradient_accumulation: false
+
 # Number of action chunks processed per GPU forward pass.
 micro_batch_size: 4
 
@@ -32,6 +36,18 @@ n_action_samples: 4
 
 # PPO clipping radius applied to the CFM-loss ratio.
 clip_coef: 0.01
+
+# Ratio estimator: vanilla averages MC losses before exp; fpo_plus_plus keeps
+# and clips one ratio per fixed MC sample.
+fpo_variant: vanilla
+
+# Manipulation FPO++ defaults to PPO. ASPO is available as an explicit
+# research option but is not the recommended fine-tuning default.
+trust_region_mode: ppo
+spo_clip_coef: 0.01
+cfm_loss_kernel: mse
+huber_delta: 1.0
+log_ratio_clamp: null
 
 # Weight applied to the state-value regression loss.
 vf_coef: 1.0
@@ -54,6 +70,9 @@ value:
 
   # Target class for state-value optimizer configuration.
   _target_: verl_vla.workers.config.FPOValueConfig
+
+  # Whether to construct and optimize a state-value head. GRPO outcome mode disables it.
+  enabled: true
 
   # State-value learning rate.
   lr: 1e-4

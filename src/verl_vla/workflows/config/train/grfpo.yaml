@@ -1,0 +1,6 @@
+# Same-condition GRPO outcomes with a Flow-Matching FPO actor objective.
+defaults:
+  - /cluster@_global_.cluster: env_actor_rollout_cluster
+  - /trainer@_global_.trainer: grfpo_trainer
+  - /ray@_global_.ray_kwargs: default
+  - override /actor@_global_.cluster.actor_rollout_ref.actor: grfpo_actor

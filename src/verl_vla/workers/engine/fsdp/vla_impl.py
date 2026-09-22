@@ -26,7 +26,6 @@ from verl.utils.fs import copy_to_local
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
-    fsdp2_load_full_state_dict,
     fsdp_version,
     load_fsdp_model_to_gpu,
     merged_lora_context,
@@ -117,9 +116,13 @@ class VLAFSDPEngine(FSDPEngine):
             "offload_policy": offload_policy,
             "reshard_after_forward": self.engine_config.reshard_after_forward,
         }
-        full_state = module.state_dict()
+        # Every rank has already loaded the same native Fast-WAM checkpoint.
+        # ``fully_shard`` shards those initialized parameters in place.  Do
+        # not reload the pre-shard state afterwards: with PyTorch 2.10 that
+        # redundant load attempts Tensor -> DTensor ``copy_`` and fails before
+        # the real resume checkpoint can be applied.  Resume loading below is
+        # strict and overwrites every model parameter from theta_old.
         apply_fsdp2(module, fsdp_kwargs, self.engine_config)
-        fsdp2_load_full_state_dict(module, full_state, self.device_mesh, offload_policy)
 
         if self.model_config.enable_activation_offload:
             enable_gradient_checkpointing = self.model_config.enable_gradient_checkpointing

@@ -14,6 +14,7 @@
 
 from .engine_workers import VLAActorRolloutRefWorker, VLAActorWorker, VLARolloutWorker
 from .fpo import FPOTrainingWorker
+from .flow_grpo import FlowGRPOTrainingWorker
 from .fsdp import VLAFSDPEngine
 from .sac import SACTrainingWorker
 from .sft import SFTTrainingWorker
@@ -24,6 +25,7 @@ __all__ = [
     "VLARolloutWorker",
     "SACTrainingWorker",
     "FPOTrainingWorker",
+    "FlowGRPOTrainingWorker",
     "SFTTrainingWorker",
     "VLAFSDPEngine",
 ]

@@ -17,9 +17,17 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 import torch
+import torch.distributed
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_state_dict,
+    set_optimizer_state_dict,
+)
+from torch.distributed.tensor import DTensor, distribute_tensor
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.fsdp_utils import (
     fsdp_version,
@@ -63,6 +71,157 @@ def _save_lora_adapter(
 
 class NativePolicyFSDPCheckpointManager(FSDPCheckpointManager):
     """Delegate ``hf_model`` export to the VLA adapter instead of AutoModel."""
+
+    _PORTABLE_MODEL = "portable_full_model.pt"
+    _PORTABLE_OPTIMIZER = "portable_full_optimizer.pt"
+    _PORTABLE_METADATA = "portable_checkpoint.json"
+
+    @staticmethod
+    def _atomic_torch_save(value, path: Path) -> None:
+        temporary_path = path.with_suffix(path.suffix + ".tmp")
+        torch.save(value, temporary_path)
+        os.replace(temporary_path, path)
+
+    def export_portable_checkpoint(self, local_path: str) -> dict[str, object]:
+        """Export a world-size-independent full model/optimizer checkpoint.
+
+        veRL's regular FSDP2 checkpoint contains DTensors tied to the mesh that
+        created it.  The official distributed-checkpoint state-dict API emits
+        canonical parameter names and full CPU tensors, allowing a later run
+        with a different FSDP world size to reshard both model and Adam state.
+        """
+
+        if self.optimizer is None:
+            raise RuntimeError("Portable checkpoint export requires an optimizer.")
+        options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        model_state, optimizer_state = get_state_dict(
+            self.model,
+            self.optimizer,
+            options=options,
+        )
+        output_dir = Path(local_path)
+        if self.rank == 0:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            self._atomic_torch_save(model_state, output_dir / self._PORTABLE_MODEL)
+            self._atomic_torch_save(optimizer_state, output_dir / self._PORTABLE_OPTIMIZER)
+            metadata = {
+                "format": "torch.distributed.checkpoint.full_state_dict",
+                "format_version": 1,
+                "source_world_size": self.world_size,
+                "model_file": self._PORTABLE_MODEL,
+                "optimizer_file": self._PORTABLE_OPTIMIZER,
+            }
+            metadata_path = output_dir / self._PORTABLE_METADATA
+            temporary_path = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+            temporary_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary_path, metadata_path)
+        torch.distributed.barrier()
+        return {
+            "portable_checkpoint": str(output_dir),
+            "source_world_size": self.world_size,
+            "rank": self.rank,
+        }
+
+    def _load_portable_checkpoint(self, local_path: str) -> None:
+        if self.optimizer is None:
+            raise RuntimeError("Portable checkpoint load requires an optimizer.")
+        checkpoint_dir = Path(local_path)
+        model_path = checkpoint_dir / self._PORTABLE_MODEL
+        optimizer_path = checkpoint_dir / self._PORTABLE_OPTIMIZER
+        if not model_path.is_file() or not optimizer_path.is_file():
+            raise FileNotFoundError(
+                "Checkpoint world size differs from the current FSDP mesh, but portable "
+                f"state is incomplete under {checkpoint_dir}."
+            )
+        print(
+            f"[Rank {self.rank}] Loading portable full model/optimizer for local reshard",
+            flush=True,
+        )
+        # Rank-0 broadcast of a 46-GB custom FSDP2 state can stall inside
+        # torch.distributed.checkpoint before launching any NCCL work.  The
+        # checkpoint resides on the node-visible filesystem and host memory is
+        # explicitly sized for all ranks, so let each rank mmap the same full
+        # state and independently derive its local shard instead.
+        model_state = torch.load(model_path, map_location="cpu", weights_only=False, mmap=True)
+        print(f"[Rank {self.rank}] Portable model mapped; applying explicit DTensor reshard", flush=True)
+        target_state = self.model.state_dict()
+        if model_state.keys() != target_state.keys():
+            missing = sorted(target_state.keys() - model_state.keys())
+            unexpected = sorted(model_state.keys() - target_state.keys())
+            raise RuntimeError(
+                "Portable model keys do not match the current model: "
+                f"missing={missing[:10]}, unexpected={unexpected[:10]}"
+            )
+        sharded_model_state = {}
+        for name, target in target_state.items():
+            source = model_state[name]
+            if isinstance(target, DTensor):
+                if not isinstance(source, torch.Tensor) or isinstance(source, DTensor):
+                    raise TypeError(f"Portable model tensor {name!r} has invalid type {type(source).__name__}.")
+                if source.shape != target.shape:
+                    raise ValueError(
+                        f"Portable model tensor {name!r} shape mismatch: {source.shape} != {target.shape}."
+                    )
+                sharded_model_state[name] = distribute_tensor(
+                    source.to(device=target.device),
+                    device_mesh=target.device_mesh,
+                    placements=target.placements,
+                    src_data_rank=None,
+                )
+            elif isinstance(target, torch.Tensor):
+                sharded_model_state[name] = source.to(device=target.device, dtype=target.dtype)
+            else:
+                sharded_model_state[name] = source
+        incompatible = self.model.load_state_dict(sharded_model_state, strict=True)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(
+                "Portable checkpoint load was not strict: "
+                f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+            )
+        del sharded_model_state, target_state, model_state
+        torch.cuda.empty_cache()
+        print(f"[Rank {self.rank}] Portable model reshard applied; loading optimizer", flush=True)
+
+        optimizer_state = torch.load(optimizer_path, map_location="cpu", weights_only=False, mmap=True)
+        set_optimizer_state_dict(
+            self.model,
+            self.optimizer,
+            optimizer_state,
+            options=StateDictOptions(
+                full_state_dict=True,
+                cpu_offload=False,
+                broadcast_from_rank0=False,
+                strict=True,
+            ),
+        )
+        del optimizer_state
+        print(f"[Rank {self.rank}] Portable optimizer reshard applied", flush=True)
+
+        # Scheduler state is identical across ranks. RNG state is restored from
+        # the source rank-0 file; subsequent rank-local data partitioning keeps
+        # stochastic FPO inputs distinct and deterministic.
+        if self.should_load_extra:
+            source_extra_path = checkpoint_dir / "extra_state_world_size_1_rank_0.pt"
+            if not source_extra_path.is_file():
+                raise FileNotFoundError(f"Missing portable extra state source: {source_extra_path}")
+            extra_state = torch.load(source_extra_path, map_location="cpu", weights_only=False)
+            if "rng" in extra_state:
+                self.load_rng_state(extra_state["rng"])
+            scheduler_state = extra_state.get("lr_scheduler")
+            if scheduler_state is not None and self.lr_scheduler is not None:
+                self.lr_scheduler.load_state_dict(scheduler_state)
+        torch.distributed.barrier()
+
+    def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load=False):
+        if local_path is None:
+            return None
+        fsdp_config_path = Path(local_path) / "fsdp_config.json"
+        if fsdp_config_path.is_file():
+            saved_world_size = int(json.loads(fsdp_config_path.read_text(encoding="utf-8"))["world_size"])
+            if saved_world_size != self.world_size:
+                self._load_portable_checkpoint(local_path)
+                return None
+        return super().load_checkpoint(local_path, hdfs_path, del_local_after_load)
 
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         should_export = self.should_save_hf_model

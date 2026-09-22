@@ -20,13 +20,16 @@ signals are converted into per-trajectory records for eval metrics.
 """
 
 import numpy as np
+import pytest
 import torch
 from verl import DataProto
 
 from verl_vla.train_cluster.cluster import TrainCluster
 
 
-def _make_output(done, *, truncated=None, success=None, reward=None, task_id=1, eval_episode_id=None) -> DataProto:
+def _make_output(
+    done, *, truncated=None, success=None, reward=None, score=None, task_id=1, eval_episode_id=None
+) -> DataProto:
     """Build the minimum rollout output consumed by _collect_trajectory_records.
 
     `done` maps to next.terminated. `truncated` is optional because production
@@ -55,13 +58,16 @@ def _make_output(done, *, truncated=None, success=None, reward=None, task_id=1, 
     non_tensors = {"obs.task_id": task_ids}
     if eval_episode_id is not None:
         non_tensors["obs.eval_episode_id"] = np.asarray(eval_episode_id, dtype=np.int64)
+    tensors = {
+        "next.terminated": terminated_tensor,
+        "next.truncated": truncated_tensor,
+        "next.success": success_tensor,
+        "next.reward": reward_tensor,
+    }
+    if score is not None:
+        tensors["next.score"] = torch.as_tensor(score, dtype=torch.float32)
     return DataProto.from_dict(
-        tensors={
-            "next.terminated": terminated_tensor,
-            "next.truncated": truncated_tensor,
-            "next.success": success_tensor,
-            "next.reward": reward_tensor,
-        },
+        tensors=tensors,
         non_tensors=non_tensors,
     )
 
@@ -185,6 +191,41 @@ class TestAutoResetTrajectoryRecords:
 
 
 class TestNonAutoResetTrajectoryRecords:
+    def test_records_process_score_at_terminal_step(self):
+        records = TrainCluster._collect_trajectory_records(
+            _make_output(
+                [[[0, 0, 1, 0]]],
+                success=[[[0, 0, 0, 0]]],
+                score=[[[0.0, 0.15, 0.15, 0.0]]],
+            ),
+            auto_reset=False,
+            carry_state=_empty_carry_state(),
+        )
+
+        assert records[0] | {"score": 0.15} == {
+            "length": 3,
+            "chunk_length": 1,
+            "return": 0.0,
+            "success": False,
+            "task_id": 1,
+            "score": 0.15,
+        }
+        assert records[0]["score"] == pytest.approx(0.15)
+
+    def test_metrics_separate_partial_completion_from_full_success(self):
+        records = [
+            {"length": 10, "chunk_length": 1, "return": 0.0, "success": False, "task_id": 0, "score": 0.0},
+            {"length": 20, "chunk_length": 1, "return": 0.0, "success": False, "task_id": 0, "score": 0.15},
+            {"length": 30, "chunk_length": 2, "return": 1.0, "success": True, "task_id": 0, "score": 1.0},
+        ]
+
+        metrics = TrainCluster._trajectory_metrics_from_records(records, metric_prefix="eval")
+
+        assert metrics["eval/trajectory_success_rate"] == pytest.approx(1 / 3)
+        assert metrics["eval/partial_or_better_rate"] == pytest.approx(2 / 3)
+        assert metrics["eval/partial_only_trajectory_count"] == 1
+        assert metrics["eval/per_task_partial_or_better_rate/task_0"] == pytest.approx(2 / 3)
+
     def test_uses_first_done_in_each_row(self):
         """Without auto-reset, each row contributes one trajectory ending at its first done."""
 

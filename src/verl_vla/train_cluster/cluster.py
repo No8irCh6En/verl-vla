@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, cast
@@ -64,6 +65,7 @@ class RolloutState:
     reset_future: Any | None = None
     carry_state: dict[str, np.ndarray | None] = field(default_factory=lambda: {"length": None, "reward": None})
     lerobot_collected_once: bool = False
+    rollouts_since_simulator_restart: int = 0
 
 
 @ray.remote
@@ -121,6 +123,7 @@ class TrainCluster:
         self.rollout_state = RolloutState()
         self._pending_rollout_ref: ray.ObjectRef | None = None
         self._ready_rollout_result = None
+        self._rollout_collection_active = False
 
     def start(self) -> None:
         self._build_resource_pool_plan()
@@ -210,8 +213,20 @@ class TrainCluster:
             resource_pool = self.resource_pool_manager.get_resource_pool(role)
             worker_name = ROLE_TO_WORKER_NAME[role]
             worker_config = self._worker_config(role)
+            remote_options = {}
+            if role == Role.Env:
+                # Each concurrent call is routed by stage_id to a distinct
+                # EnvManager subprocess. This is the Ray-native equivalent of
+                # an environment step thread pool and removes accidental RPC
+                # serialization across pipeline stages.
+                remote_options["max_concurrency"] = int(worker_config.env_worker.ray_max_concurrency)
+            remote_cls = (
+                ray.remote(**remote_options)(role_worker_mapping[role])
+                if remote_options
+                else ray.remote(role_worker_mapping[role])
+            )
             ray_cls_with_init = RayClassWithInitArgs(
-                cls=ray.remote(role_worker_mapping[role]),
+                cls=remote_cls,
                 config=worker_config,
                 role=worker_name,
             )
@@ -386,6 +401,7 @@ class TrainCluster:
         self,
         *,
         async_rollout: bool = False,
+        active_pipeline_stages: int | None = None,
     ) -> tuple[DataProto, DataProto, dict[str, dict[str, Any]], dict[str, float]]:
         if self.cluster_type != "env_loop":
             raise RuntimeError("rollout is only wired for env-loop train clusters.")
@@ -395,15 +411,24 @@ class TrainCluster:
             # A separate rollout model is not updated by the actor optimizer.
             # Synchronize immediately before collection so on-policy trainers
             # never collect with the preceding actor version.
-            self.update_weights()
+            if self._rollout_collection_active:
+                weight_sync_s = 0.0
+            else:
+                sync_start = time.perf_counter()
+                self.update_weights()
+                weight_sync_s = time.perf_counter() - sync_start
             output, last_obs, collected_datasets, metrics, self.rollout_state = self._rollout_once(
                 self.env_loop,
                 config=self.config,
                 state=self.rollout_state,
+                active_pipeline_stages=active_pipeline_stages,
             )
+            metrics["timing_s/rollout_weight_sync"] = weight_sync_s
             return output, last_obs, collected_datasets, metrics
 
         else:
+            if active_pipeline_stages is not None:
+                raise ValueError("active_pipeline_stages is only supported by synchronous rollout.")
             if not self.config.resource.separate_rollout_model.enabled:
                 raise ValueError("async_rollout requires separate actor and rollout workers.")
 
@@ -424,7 +449,9 @@ class TrainCluster:
 
             output, last_obs, collected_datasets, metrics, self.rollout_state = result
 
+            sync_start = time.perf_counter()
             self.update_weights()
+            metrics["timing_s/rollout_weight_sync"] = time.perf_counter() - sync_start
 
             self._pending_rollout_ref = ray_rollout_once.remote(
                 self.env_loop,
@@ -439,6 +466,7 @@ class TrainCluster:
         *,
         config: EnvLoopTrainClusterConfig,
         state: RolloutState,
+        active_pipeline_stages: int | None = None,
     ) -> tuple[
         DataProto,
         DataProto,
@@ -446,24 +474,77 @@ class TrainCluster:
         dict[str, float],
         RolloutState,
     ]:
+        rollout_once_start = time.perf_counter()
         reset_future = state.reset_future
         if reset_future is None:
             reset_future = env_loop.env_wg.reset_env()
-        output, last_obs = env_loop.generate_sequences(reset_future)
+        generate_start = time.perf_counter()
+        if active_pipeline_stages is None:
+            output, last_obs = env_loop.generate_sequences(reset_future)
+        else:
+            output, last_obs = env_loop.generate_sequences(
+                reset_future,
+                active_stage_count=active_pipeline_stages,
+            )
+        generate_s = time.perf_counter() - generate_start
+        restart_s = 0.0
+        simulator_config = config.env.env_worker.simulator
+        robodojo_config = getattr(simulator_config, "robodojo", None)
+        restart_between_rollouts = bool(
+            getattr(simulator_config, "simulator_type", None) == "robodojo"
+            and robodojo_config is not None
+            and getattr(robodojo_config, "restart_between_rollouts", False)
+        )
+        restart_every_rollouts = int(getattr(robodojo_config, "restart_every_rollouts", 1))
+        if restart_between_rollouts:
+            state.rollouts_since_simulator_restart += 1
+        restart_due = restart_between_rollouts and state.rollouts_since_simulator_restart >= restart_every_rollouts
+        if restart_due:
+            restart_start = time.perf_counter()
+            env_loop.env_wg.restart_simulators(mode="train")
+            restart_s = time.perf_counter() - restart_start
+            state.rollouts_since_simulator_restart = 0
+        reset_dispatch_start = time.perf_counter()
         state.reset_future = env_loop.env_wg.reset_env()
+        reset_dispatch_s = time.perf_counter() - reset_dispatch_start
         metrics = dict(output.meta_info.pop("metrics", {}))
+        metrics["timing_s/env_simulator_restart"] = restart_s
+        metrics["count/env_simulator_restarts"] = float(restart_due)
+        trajectory_records_start = time.perf_counter()
         trajectory_records = TrainCluster._collect_trajectory_records(
             output,
             auto_reset=config.env.env_worker.auto_reset,
             carry_state=state.carry_state,
         )
+        trajectory_records_s = time.perf_counter() - trajectory_records_start
         metrics.update(TrainCluster._trajectory_metrics_from_records(trajectory_records, metric_prefix="data"))
+        dataset_collection_start = time.perf_counter()
         collected_datasets, lerobot_collected_once = TrainCluster._collect_lerobot_datasets(
             env_loop.env_wg,
             config=config,
             lerobot_collected_once=state.lerobot_collected_once,
         )
+        dataset_collection_s = time.perf_counter() - dataset_collection_start
         state.lerobot_collected_once = lerobot_collected_once
+        rollout_once_s = time.perf_counter() - rollout_once_start
+        metrics.update(
+            {
+                "timing_s/rollout_once_total": rollout_once_s,
+                "timing_s/rollout_generate_sequences": generate_s,
+                "timing_s/rollout_reset_dispatch": reset_dispatch_s,
+                "timing_s/rollout_trajectory_records": trajectory_records_s,
+                "timing_s/rollout_dataset_collection": dataset_collection_s,
+                "timing_s/rollout_unaccounted": max(
+                    0.0,
+                    rollout_once_s
+                    - generate_s
+                    - restart_s
+                    - reset_dispatch_s
+                    - trajectory_records_s
+                    - dataset_collection_s,
+                ),
+            }
+        )
         return output, last_obs, collected_datasets, metrics, state
 
     @staticmethod
@@ -501,10 +582,38 @@ class TrainCluster:
 
     def train(self, data: DataProto, *, async_update: bool = True) -> Any:
         assert self.cluster_type in {"sft", "env_loop"}
+        if self._rollout_collection_active:
+            raise RuntimeError("Actor training cannot begin inside a rollout collection window.")
         actor_wg = self.actor_worker_group
         if async_update:
             return actor_wg.update_actor_async(data)
         return actor_wg.update_actor(data)
+
+    def diagnose_fpo_task_gradients(self, data: DataProto) -> Any:
+        """Read-only fixed-MC gradient diagnostics on the actor worker group."""
+
+        if self._rollout_collection_active:
+            raise RuntimeError("Gradient diagnostics cannot begin inside a rollout collection window.")
+        return self.actor_worker_group.diagnose_fpo_task_gradients(data)
+
+    def generate_actions(self, observations: DataProto, *, eval: bool = True) -> DataProto:
+        """Run the configured rollout worker on caller-supplied observations.
+
+        This uses the same worker group and actor/rollout mode lifecycle as an
+        environment rollout, and is intended for fixed-observation diagnostics.
+        """
+
+        if self.cluster_type != "env_loop" or self.env_loop is None:
+            raise RuntimeError("generate_actions is only wired for an initialized env-loop train cluster.")
+        rollout_wg = self.env_loop.rollout_wg
+        observations.meta_info = {**observations.meta_info, "eval": bool(eval)}
+        if self.env_loop.switch_actor_rollout_mode:
+            rollout_wg.switch_to_rollout()
+        try:
+            return rollout_wg.generate_sequences(observations).get()
+        finally:
+            if self.env_loop.switch_actor_rollout_mode:
+                rollout_wg.switch_to_train()
 
     def record(self, *, collect_dataset: bool = True) -> Path | None:
         env_wg = self._single_env_worker_group("record")
@@ -553,6 +662,35 @@ class TrainCluster:
             assert self.checkpoint_engine_manager is not None
             self.checkpoint_engine_manager.update_weights()
 
+    def begin_rollout_collection(self) -> dict[str, float]:
+        """Freeze one rollout policy version across repeated synchronous rollouts."""
+
+        if self.cluster_type != "env_loop" or self.env_loop is None:
+            raise RuntimeError("Rollout collection windows require an initialized env-loop cluster.")
+        if self._rollout_collection_active:
+            raise RuntimeError("A rollout collection window is already active.")
+        if self._pending_rollout_ref is not None:
+            raise RuntimeError("Cannot begin a synchronous collection window with async rollout in flight.")
+
+        sync_start_t = time.perf_counter()
+        self.update_weights()
+        metrics = {"timing_s/collection_weight_sync": time.perf_counter() - sync_start_t}
+        metrics.update(self.env_loop.begin_rollout_collection())
+        self._rollout_collection_active = True
+        return metrics
+
+    def end_rollout_collection(self) -> dict[str, float]:
+        """Close the current rollout-policy window before actor optimization."""
+
+        if self.cluster_type != "env_loop" or self.env_loop is None:
+            raise RuntimeError("Rollout collection windows require an initialized env-loop cluster.")
+        if not self._rollout_collection_active:
+            raise RuntimeError("No rollout collection window is active.")
+        try:
+            return self.env_loop.end_rollout_collection()
+        finally:
+            self._rollout_collection_active = False
+
     def eval(
         self,
         *,
@@ -560,6 +698,8 @@ class TrainCluster:
     ) -> dict[str, float]:
         if self.cluster_type != "env_loop":
             raise RuntimeError("eval is only wired for env-loop train clusters.")
+        if self._rollout_collection_active:
+            raise RuntimeError("Evaluation cannot begin inside a rollout collection window.")
 
         # Evaluation is a policy boundary: it must observe the actor state
         # produced by the most recent update, not the last rollout snapshot.
@@ -604,7 +744,10 @@ class TrainCluster:
                 for record in new_records:
                     eval_episode_id = int(record.get("eval_episode_id", -1))
                     if eval_episode_id < 0 or eval_episode_id >= benchmark_size:
-                        continue
+                        raise RuntimeError(
+                            "Evaluation environment returned an out-of-range fixed-case id: "
+                            f"eval_episode_id={eval_episode_id}, benchmark_size={benchmark_size}."
+                        )
                     if accepted_eval_episode_counts[eval_episode_id] >= target_eval_episode_counts[eval_episode_id]:
                         continue
                     trajectory_records.append(record)
@@ -613,6 +756,7 @@ class TrainCluster:
                 trajectory_records.extend(new_records[: target_episodes - len(trajectory_records)])
             eval_step += 1
 
+        self.last_eval_records = [dict(record) for record in trajectory_records]
         metrics = self._trajectory_metrics_from_records(
             trajectory_records,
             metric_prefix="val",
@@ -620,6 +764,17 @@ class TrainCluster:
         )
         for key, values in rollout_metric_lists.items():
             metrics[key] = float(np.mean(values)) if values else 0.0
+
+        # ``_rollout_once`` prefetches the next training reset before the
+        # trainer enters evaluation.  When train and eval share a simulator,
+        # evaluation subsequently mutates that simulator while the prefetched
+        # observation remains cached in ``rollout_state``.  Refresh both sides
+        # of the boundary after evaluation so the next rollout starts from an
+        # observation that matches the simulator's actual fresh train state.
+        # Reset the auto-reset carry too, since this deliberately starts a new
+        # training episode rather than continuing a pre-eval partial one.
+        self.rollout_state.reset_future = env_wg.reset_env(mode="train")
+        self.rollout_state.carry_state = {"length": None, "reward": None}
         return metrics
 
     @staticmethod
@@ -636,6 +791,7 @@ class TrainCluster:
         raw_done_steps = output.batch["next.terminated"].bool() | output.batch["next.truncated"].bool()
         raw_reward_steps = output.batch["next.reward"].float()
         raw_success_steps = output.batch["next.success"].bool()
+        raw_score_steps = output.batch.get("next.score")
         done_chunks = raw_done_steps.reshape(raw_done_steps.shape[0], raw_done_steps.shape[1], -1)
         reward_chunks = raw_reward_steps.reshape(raw_reward_steps.shape[0], raw_reward_steps.shape[1], -1)
         success_chunks = raw_success_steps.reshape(raw_success_steps.shape[0], raw_success_steps.shape[1], -1)
@@ -643,6 +799,11 @@ class TrainCluster:
         done_steps = done_chunks.reshape(done_chunks.shape[0], -1)
         reward_steps = reward_chunks.reshape(reward_chunks.shape[0], -1)
         success_steps = success_chunks.reshape(success_chunks.shape[0], -1)
+        score_chunks = None
+        score_steps = None
+        if raw_score_steps is not None:
+            score_chunks = raw_score_steps.float().reshape(raw_score_steps.shape[0], raw_score_steps.shape[1], -1)
+            score_steps = score_chunks.reshape(score_chunks.shape[0], -1)
         task_id_steps = np.asarray(output.non_tensor_batch["obs.task_id"])
         eval_episode_id_steps = output.non_tensor_batch.get("obs.eval_episode_id")
         if eval_episode_id_steps is not None:
@@ -651,14 +812,21 @@ class TrainCluster:
         flat_eval_episode_id_steps = (
             np.repeat(eval_episode_id_steps, chunk_steps, axis=1) if eval_episode_id_steps is not None else None
         )
+        metadata_steps = {
+            field: np.repeat(np.asarray(output.non_tensor_batch[f"obs.{field}"]), chunk_steps, axis=1)
+            for field in ("layout_id", "environment_seed", "policy_seed")
+            if f"obs.{field}" in output.non_tensor_batch
+        }
 
         if not auto_reset:
             return TrainCluster._collect_non_auto_reset_trajectory_records(
                 done_steps,
                 reward_steps,
                 success_steps,
+                score_steps=score_steps,
                 task_id_steps=flat_task_id_steps,
                 eval_episode_id_steps=flat_eval_episode_id_steps,
+                metadata_steps=metadata_steps,
                 chunk_steps=chunk_steps,
                 remaining=remaining,
             )
@@ -719,6 +887,8 @@ class TrainCluster:
                     "success": bool(chunk_success[segment].any().item()),
                     "task_id": task_id,
                 }
+                if score_chunks is not None:
+                    record["score"] = float(score_chunks[batch_idx, chunk_idx, done_idx].item())
                 if eval_episode_id is not None:
                     record["eval_episode_id"] = eval_episode_id
                 records.append(record)
@@ -738,8 +908,10 @@ class TrainCluster:
         reward_steps: torch.Tensor,
         success_steps: torch.Tensor,
         *,
+        score_steps: torch.Tensor | None,
         task_id_steps: np.ndarray,
         eval_episode_id_steps: np.ndarray | None,
+        metadata_steps: dict[str, np.ndarray],
         chunk_steps: int,
         remaining: int | None,
     ) -> list[dict[str, float | int | bool]]:
@@ -765,8 +937,12 @@ class TrainCluster:
                 "success": bool(success_row[segment].any().item()),
                 "task_id": task_id,
             }
+            if score_steps is not None:
+                record["score"] = float(score_steps[batch_idx, done_idx].item())
             if eval_episode_id is not None:
                 record["eval_episode_id"] = eval_episode_id
+            for metadata_field, values in metadata_steps.items():
+                record[metadata_field] = int(values[batch_idx, 0])
             records.append(record)
         return records
 
@@ -797,6 +973,18 @@ class TrainCluster:
                 float(success_count / trajectory_count) if trajectory_count > 0 else 0.0
             ),
         }
+        scored_records = [record for record in records if "score" in record]
+        if scored_records:
+            if len(scored_records) != len(records):
+                raise RuntimeError("Process score is missing from a subset of evaluation trajectories.")
+            partial_or_better = [record for record in scored_records if float(record["score"]) >= 0.15]
+            partial_only = [record for record in partial_or_better if not bool(record["success"])]
+            metrics[f"{metric_prefix}/avg_score"] = float(
+                np.mean([float(record["score"]) for record in scored_records])
+            )
+            metrics[f"{metric_prefix}/partial_or_better_trajectory_count"] = float(len(partial_or_better))
+            metrics[f"{metric_prefix}/partial_or_better_rate"] = float(len(partial_or_better) / len(scored_records))
+            metrics[f"{metric_prefix}/partial_only_trajectory_count"] = float(len(partial_only))
         if benchmark_size is not None:
             metrics[f"{metric_prefix}/benchmark_size"] = float(benchmark_size)
         task_ids = sorted({int(record["task_id"]) for record in records if int(record["task_id"]) >= 0})
@@ -813,6 +1001,15 @@ class TrainCluster:
             metrics[f"{metric_prefix}/per_task_success_rate/task_{task_id}"] = (
                 float(success_count / trajectory_count) if trajectory_count > 0 else 0.0
             )
+            task_scored_records = [record for record in task_records if "score" in record]
+            if task_scored_records:
+                task_partial_or_better = sum(float(record["score"]) >= 0.15 for record in task_scored_records)
+                metrics[f"{metric_prefix}/per_task_partial_or_better_rate/task_{task_id}"] = float(
+                    task_partial_or_better / len(task_scored_records)
+                )
+                metrics[f"{metric_prefix}/per_task_avg_score/task_{task_id}"] = float(
+                    np.mean([float(record["score"]) for record in task_scored_records])
+                )
             metrics[f"{metric_prefix}/per_task_avg_success_trajectory_length/task_{task_id}"] = (
                 float(np.mean([int(record["length"]) for record in task_success_records]))
                 if task_success_records
