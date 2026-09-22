@@ -22,6 +22,7 @@ from .arena import ArenaLeRobotStrategy
 from .base import BaseLeRobotStrategy
 from .libero import LiberoLeRobotStrategy
 from .piper import PiperLeRobotStrategy
+from .robodojo import RoboDojoLeRobotStrategy
 
 StrategyFactory = Callable[..., BaseLeRobotStrategy]
 
@@ -29,6 +30,7 @@ _REGISTRY: dict[str, StrategyFactory] = {
     "arena": ArenaLeRobotStrategy,
     "libero": LiberoLeRobotStrategy,
     "piper": PiperLeRobotStrategy,
+    "robodojo": RoboDojoLeRobotStrategy,
 }
 
 

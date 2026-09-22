@@ -14,6 +14,10 @@
 # limitations under the License.
 
 import copy
+import logging
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -38,7 +42,67 @@ from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerCon
 from verl_vla.recorder import merge_lerobot_datasets
 from verl_vla.workers.env.config import EnvWorkerConfig
 
-from .env_manager import EnvManager
+from .env_manager import EnvManager, SimulatorCommandTimeoutError
+
+logger = logging.getLogger(__name__)
+
+
+def _reset_simulator_with_recovery(
+    simulator: EnvManager,
+    *,
+    options: dict,
+    timeout_s: float,
+    max_process_restarts: int,
+):
+    """Retry a timed-out reset from the latest completed reset boundary.
+
+    Snapshotting immediately after every successful reset is essential for a
+    simulator shared by train and evaluation.  Otherwise a timeout during a
+    later reset can restore the cursor captured by an old periodic restart and
+    silently put different worker/stage processes on different policy-seed
+    waves.
+    """
+
+    process_restarts = 0
+    while True:
+        try:
+            result = simulator.call("reset", options=options, timeout_s=timeout_s)
+            simulator.snapshot_state(timeout_s=min(float(timeout_s), 30.0))
+            return result, process_restarts
+        except SimulatorCommandTimeoutError:
+            if process_restarts >= max_process_restarts:
+                raise
+            process_restarts += 1
+            logger.error(
+                "RoboDojo reset/state-snapshot RPC timed out; force-restarting simulator "
+                "(retry=%s/%s, rank=%s, stage_id=%s).",
+                process_restarts,
+                max_process_restarts,
+                simulator.rank,
+                simulator.stage_id,
+            )
+            simulator.force_stop_simulator()
+            simulator.start_simulator()
+
+
+def _restart_simulators_with_parallel_start(simulators: list[EnvManager]) -> None:
+    """Restart independent stage subprocesses without serializing Isaac startup.
+
+    All old children are stopped before any replacement is started.  This keeps
+    the number of live simulator processes bounded by the configured stage
+    count while allowing the expensive, independent Isaac/Kit startups to
+    overlap inside one EnvWorker.
+    """
+
+    if not simulators:
+        return
+    for simulator in simulators:
+        simulator.stop_simulator()
+    if len(simulators) == 1:
+        simulators[0].start_simulator()
+        return
+    with ThreadPoolExecutor(max_workers=len(simulators)) as executor:
+        list(executor.map(lambda simulator: simulator.start_simulator(), simulators))
 
 
 def dispatch_reset_env(worker_group, *args, **kwargs):
@@ -73,12 +137,15 @@ def put_tensor_cpu(data_dict):
     return data_dict
 
 
-def create_env_batch_dataproto(obs, rewards, terminations, truncations, successes, meta=None):
+def create_env_batch_dataproto(obs, rewards, terminations, truncations, successes, scores=None, meta=None):
     step_result = {
         "observation": obs["observation"],
         "task": obs["task"],
         "task_id": obs.get("task_id"),
         "eval_episode_id": obs.get("eval_episode_id"),
+        "layout_id": obs.get("layout_id"),
+        "environment_seed": obs.get("environment_seed"),
+        "policy_seed": obs.get("policy_seed"),
         "next.reward": rewards,
         "next.terminated": terminations,
         "next.truncated": truncations,
@@ -102,10 +169,15 @@ def create_env_batch_dataproto(obs, rewards, terminations, truncations, successe
         "next.truncated": step_result["next.truncated"],
         "next.success": step_result["next.success"],
     }
+    if scores is not None:
+        tensor_batch["next.score"] = torch.as_tensor(scores, dtype=torch.float32)
     non_tensor_batch = {"obs.task": step_result["task"]}
     non_tensor_batch["obs.task_id"] = np.asarray(step_result["task_id"], dtype=np.int64)
     if step_result["eval_episode_id"] is not None:
         non_tensor_batch["obs.eval_episode_id"] = np.asarray(step_result["eval_episode_id"], dtype=np.int64)
+    for field in ("layout_id", "environment_seed", "policy_seed"):
+        if step_result[field] is not None:
+            non_tensor_batch[f"obs.{field}"] = np.asarray(step_result[field], dtype=np.int64)
     output = DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch)
 
     return output
@@ -152,6 +224,30 @@ class EnvWorker(Worker, DistProfilerExtension):
             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
         )
 
+    def _robodojo_simulator_cfg_for_stage(self, stage_id: int):
+        """Bind one persistent RoboDojo task to this worker-stage process."""
+
+        robodojo_cfg = self.env_worker_cfg.simulator.robodojo
+        if robodojo_cfg is None:
+            raise ValueError("RoboDojo simulator requires simulator.robodojo config.")
+        task_name, task_id = robodojo_cfg.task_assignment(
+            worker_rank=int(self.rank),
+            worker_world_size=int(self.world_size),
+            stage_id=int(stage_id),
+            stage_num=int(self.stage_num),
+        )
+        stage_cfg = copy.deepcopy(self.simulator_cfg)
+        OmegaConf.update(stage_cfg, "simulator.robodojo.task_name", task_name)
+        OmegaConf.update(stage_cfg, "simulator.robodojo.task_id", task_id)
+        logger.warning(
+            "RoboDojo persistent task assignment: worker_rank=%d stage_id=%d task=%s task_id=%d",
+            int(self.rank),
+            int(stage_id),
+            task_name,
+            task_id,
+        )
+        return stage_cfg
+
     def _make_eval_env_cfg(self):
         eval_cfg = copy.deepcopy(self.simulator_cfg)
         OmegaConf.set_readonly(eval_cfg, False)
@@ -169,7 +265,7 @@ class EnvWorker(Worker, DistProfilerExtension):
             # both train and eval (eval is selected via the reset_eval option at
             # reset time), so reuse the shared simulator list instead of a
             # dedicated eval one.
-            if self.simulator_type in ("arena", "isaac", "lerobot", "piper") and self.simulator_list:
+            if self.simulator_type in ("arena", "isaac", "lerobot", "piper", "robodojo") and self.simulator_list:
                 return self.simulator_list
             raise RuntimeError("Eval simulator is not initialized. Add 'eval' to env.env_worker.modes.")
         return self.simulator_list
@@ -177,6 +273,20 @@ class EnvWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     @DistProfiler.annotate(color="green", role="env_init")
     def init_worker(self):
+        logger.warning(
+            "Environment worker placement: simulator=%s rank=%s cuda_visible_devices=%s",
+            self.simulator_type,
+            self.rank,
+            os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        )
+        start_delay_s = float(self.env_worker_cfg.initial_start_stagger_s) * int(self.rank)
+        if start_delay_s > 0:
+            logger.warning(
+                "Staggering initial simulator startup by %.1fs for env rank %s",
+                start_delay_s,
+                self.rank,
+            )
+            time.sleep(start_delay_s)
         if self.simulator_type == "libero":
             from verl_vla.envs.libero.libero_env import LiberoEnv
 
@@ -271,6 +381,21 @@ class EnvWorker(Worker, DistProfilerExtension):
                         start_timeout_s=self.env_worker_cfg.simulator_start_timeout_s,
                     )
                 )
+        elif self.simulator_type == "robodojo":
+            from verl_vla.envs.robodojo.robodojo_env import RoboDojoEnv
+
+            for stage_id in range(self.stage_num):
+                self.simulator_list.append(
+                    EnvManager(
+                        self._robodojo_simulator_cfg_for_stage(stage_id),
+                        rank=self._rank,
+                        world_size=self._world_size,
+                        env_cls=RoboDojoEnv,
+                        stage_id=stage_id,
+                        stage_num=self.stage_num,
+                        start_timeout_s=self.env_worker_cfg.simulator_start_timeout_s,
+                    )
+                )
         else:
             raise NotImplementedError(f"Simulator type {self.simulator_type} not implemented")
 
@@ -304,14 +429,19 @@ class EnvWorker(Worker, DistProfilerExtension):
         stage_id: int = data.meta_info["stage_id"]
 
         simulators = self._simulators(mode)
+        step_start = time.perf_counter()
         step_output = simulators[stage_id].step(chunk_actions, chunk_values=chunk_values)
+        step_seconds = time.perf_counter() - step_start
         if len(step_output) == 4:
             extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations = step_output
             chunk_successes = chunk_terminations
+            chunk_scores = None
         elif len(step_output) == 5:
             extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, chunk_successes = step_output
+            chunk_scores = None
         else:
-            extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, chunk_successes, _infos = step_output
+            extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, chunk_successes, infos = step_output
+            chunk_scores = infos.get("score") if isinstance(infos, dict) else None
 
         env_batch = create_env_batch_dataproto(
             obs=extracted_obs,
@@ -319,6 +449,10 @@ class EnvWorker(Worker, DistProfilerExtension):
             terminations=chunk_terminations,
             truncations=chunk_truncations,
             successes=chunk_successes,
+            scores=chunk_scores,
+        )
+        env_batch.batch["profile.env_step_seconds"] = torch.full(
+            (len(env_batch),), step_seconds, dtype=torch.float64
         )
         return env_batch
 
@@ -341,16 +475,60 @@ class EnvWorker(Worker, DistProfilerExtension):
         reset_eval = bool(_data.meta_info.get("reset_eval", False))
         simulators = self._simulators(mode)
 
-        result_list = []
-        for stage_id in range(self.stage_num):
+        robodojo_cfg = self.env_worker_cfg.simulator.robodojo if self.simulator_type == "robodojo" else None
+
+        def _reset_stage(stage_id: int):
             options = {
                 "env_idx": list(range(self.env_worker_cfg.num_envs)),
                 "mode": mode,
+                "extra": {"mode": mode},
             }
             if reset_eval:
                 options["reset_eval"] = True
-            result = simulators[stage_id].reset(options=options)
-            result_list.append(result)
+            reset_start = time.perf_counter()
+            if robodojo_cfg is None:
+                result = simulators[stage_id].reset(options=options)
+                process_restarts = 0
+            else:
+                cold_stagger_s = float(self.env_worker_cfg.cold_reset_stagger_s)
+                if simulators[stage_id].cold_start_pending and cold_stagger_s > 0:
+                    # task_assignment() is stage-major, so use the same global
+                    # slot order to spread cold USD/material loads across all
+                    # EnvWorkers on the node.  A recovered single child does
+                    # not affect the on-policy/group boundary.
+                    global_stage_slot = int(stage_id) * int(self.world_size) + int(self.rank)
+                    delay_s = cold_stagger_s * global_stage_slot
+                    if delay_s > 0:
+                        logger.warning(
+                            "Staggering cold RoboDojo reset by %.1fs "
+                            "(rank=%s stage_id=%s global_stage_slot=%s).",
+                            delay_s,
+                            self.rank,
+                            stage_id,
+                            global_stage_slot,
+                        )
+                        time.sleep(delay_s)
+                result, process_restarts = _reset_simulator_with_recovery(
+                    simulators[stage_id],
+                    options=options,
+                    timeout_s=float(robodojo_cfg.reset_rpc_timeout_s),
+                    max_process_restarts=int(robodojo_cfg.reset_process_max_restarts),
+                )
+            return stage_id, result, time.perf_counter() - reset_start, process_restarts
+
+        if self.stage_num > 1:
+            # Every stage owns an independent EnvManager subprocess.  Reset
+            # their already-initialized RoboDojo instances concurrently, as
+            # the rollout step path already does, while restoring stage-major
+            # order before DataProto assembly.
+            with ThreadPoolExecutor(max_workers=self.stage_num) as executor:
+                stage_results = list(executor.map(_reset_stage, range(self.stage_num)))
+        else:
+            stage_results = [_reset_stage(0)]
+        stage_results.sort(key=lambda item: item[0])
+        result_list = [item[1] for item in stage_results]
+        reset_durations = [item[2] for item in stage_results]
+        reset_process_restarts = [item[3] for item in stage_results]
         output_tensor_dict = {}
         output_non_tensor_dict = {}
 
@@ -366,9 +544,43 @@ class EnvWorker(Worker, DistProfilerExtension):
         ]
         if eval_episode_ids:
             output_non_tensor_dict["eval_episode_id"] = np.asarray(eval_episode_ids, dtype=np.int64)
+        for field in ("layout_id", "environment_seed", "policy_seed"):
+            values = [value for obs, _info in result_list for value in obs.get(field, [])]
+            if values:
+                output_non_tensor_dict[field] = np.asarray(values, dtype=np.int64)
+
+        output_tensor_dict["profile.reset_seconds"] = torch.as_tensor(
+            [
+                reset_seconds
+                for (obs, _info), reset_seconds in zip(result_list, reset_durations, strict=True)
+                for _ in obs["observation"]
+            ],
+            dtype=torch.float64,
+        )
+        output_tensor_dict["profile.reset_process_restarts"] = torch.as_tensor(
+            [
+                process_restarts
+                for (obs, _info), process_restarts in zip(result_list, reset_process_restarts, strict=True)
+                for _ in obs["observation"]
+            ],
+            dtype=torch.int64,
+        )
 
         output = DataProto.from_dict(tensors=output_tensor_dict, non_tensors=output_non_tensor_dict)
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def restart_simulators(self, mode: str = "train") -> None:
+        """Recreate simulator subprocesses while preserving adapter-owned state."""
+
+        simulators = self._simulators(mode)
+        robodojo_cfg = self.env_worker_cfg.simulator.robodojo if self.simulator_type == "robodojo" else None
+        if robodojo_cfg is not None and bool(robodojo_cfg.parallel_restart_stages):
+            _restart_simulators_with_parallel_start(simulators)
+        else:
+            for simulator in simulators:
+                simulator.stop_simulator()
+                simulator.start_simulator()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     @DistProfiler.annotate(color="blue", role="env_record")

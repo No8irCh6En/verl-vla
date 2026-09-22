@@ -152,7 +152,12 @@ class VideoRecorder(BaseRecorder):
 
         font = ImageFont.load_default(size=self.cfg.font_size)
         line_height = max(self.cfg.font_size + 6, int(self.cfg.font_size * 1.35))
-        panel_height = max(line_height * 4, line_height * (len(lines) + 1))
+        # Movie encoders require every frame to have exactly the same size.
+        # Action values can change their wrapped-line count from frame to frame,
+        # so render one width-limited line per field and size from field count.
+        # This also reserves enough room for the trailing layout/policy ids.
+        display_lines = [VideoRecorder._fit_line(line, font, image.shape[1] - 20) for line in lines]
+        panel_height = max(line_height * 4, line_height * (len(display_lines) + 1))
         total_height = image.shape[0] + panel_height
         total_height = int(np.ceil(total_height / 16) * 16)
         panel_height = total_height - image.shape[0]
@@ -161,13 +166,23 @@ class VideoRecorder(BaseRecorder):
 
         draw = ImageDraw.Draw(canvas)
         y = image.shape[0] + max(8, self.cfg.font_size // 2)
-        for line in lines:
-            for wrapped in VideoRecorder._wrap_line(line, font, image.shape[1] - 20):
-                if y + line_height > image.shape[0] + panel_height:
-                    return np.asarray(canvas)
-                draw.text((10, y), wrapped, fill=(235, 238, 245), font=font)
-                y += line_height
+        for line in display_lines:
+            if y + line_height > image.shape[0] + panel_height:
+                return np.asarray(canvas)
+            draw.text((10, y), line, fill=(235, 238, 245), font=font)
+            y += line_height
         return np.asarray(canvas)
+
+    @staticmethod
+    def _fit_line(line: str, font: ImageFont.ImageFont, max_width: int) -> str:
+        if font.getlength(line) <= max_width:
+            return line
+        suffix = " ..."
+        available = max_width - font.getlength(suffix)
+        end = len(line)
+        while end > 0 and font.getlength(line[:end]) > available:
+            end -= 1
+        return line[:end].rstrip() + suffix
 
     @staticmethod
     def _wrap_line(line: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:

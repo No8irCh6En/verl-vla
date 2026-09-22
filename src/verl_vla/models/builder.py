@@ -45,6 +45,17 @@ def build_vla_model(model_config, *, torch_dtype: torch.dtype):
             torch_dtype=torch_dtype,
         )
 
+    if architecture == "fastwam":
+        from .fastwam import FastWAMTrainableModel
+
+        if overrides:
+            raise ValueError("Fast-WAM architecture is checkpoint-owned; model.override_config must be empty")
+        return FastWAMTrainableModel.from_pretrained(
+            path,
+            adapter_config=dict(model_config.adapter),
+            torch_dtype=torch_dtype,
+        )
+
     if architecture == "act":
         from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies.act.configuration_act import ACTConfig

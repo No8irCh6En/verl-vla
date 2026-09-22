@@ -63,6 +63,9 @@ class BaseRecorder(ABC):
         del mode
         return False
 
+    def flush(self) -> None:  # noqa: B027
+        """Wait until all previously submitted recording work is durable."""
+
     @abstractmethod
     def finalize(self) -> None:
         """Release recorder resources and clear temporary state."""

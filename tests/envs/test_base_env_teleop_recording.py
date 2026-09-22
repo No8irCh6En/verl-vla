@@ -109,6 +109,11 @@ class FakeBaseEnv(BaseEnv):
             "observation": [f"{prefix}-obs-{int(env_id)}" for env_id in env_ids],
             "task": [f"{prefix}-task-{int(env_id)}" for env_id in env_ids],
             "task_id": env_ids.astype(np.int64, copy=False),
+            "suite_id": env_ids + 10,
+            "eval_episode_id": env_ids + 100,
+            "layout_id": env_ids + 200,
+            "environment_seed": env_ids + 300,
+            "policy_seed": env_ids + 3000,
         }
 
 
@@ -207,10 +212,9 @@ def test_record_done_control_is_not_overwritten_by_later_chunk_step(
 
     obs, reward, terminated, truncated, success = env.step(np.asarray([[[100.0], [101.0]]], dtype=np.float32))
 
-    assert env.step_calls == [[0], [0]]
+    assert env.step_calls == [[0]]
     assert [action.tolist() for action in env.action_calls] == [
         [[100.0]],
-        [[101.0]],
     ]
     assert obs["observation"] == ["reset-obs-0"]
     assert reward.tolist() == expected_reward
@@ -219,6 +223,61 @@ def test_record_done_control_is_not_overwritten_by_later_chunk_step(
     assert success.tolist() == expected_success
     assert env.reset_calls == [[0]]
     assert env.recorder_reset_calls == [[0]]
+
+
+def test_serial_chunk_skips_env_after_earlier_backend_termination() -> None:
+    env = FakeBaseEnv(num_envs=2, terminate_env_ids=[0], auto_reset=False)
+
+    obs, reward, terminated, truncated, success = env.step(
+        np.asarray(
+            [
+                [[100.0], [101.0]],
+                [[200.0], [201.0]],
+            ],
+            dtype=np.float32,
+        )
+    )
+
+    assert env.step_calls == [[0, 1], [1]]
+    assert [action.tolist() for action in env.action_calls] == [
+        [[100.0], [200.0]],
+        [[201.0]],
+    ]
+    assert obs["observation"] == ["step-1-obs-0", "step-2-obs-1"]
+    assert reward.tolist() == [[0.0, 0.0], [0.0, 0.0]]
+    assert terminated.tolist() == [[True, False], [False, False]]
+    assert truncated.tolist() == [[False, False], [False, False]]
+    assert success.tolist() == [[True, False], [False, False]]
+    assert env.reset_calls == []
+
+
+def test_serial_action_result_preserves_episode_identity_metadata() -> None:
+    env = FakeBaseEnv(num_envs=2, auto_reset=False)
+
+    obs, *_ = env.step(np.zeros((2, 2, 1), dtype=np.float32))
+
+    assert obs["suite_id"].tolist() == [10, 11]
+    assert obs["eval_episode_id"].tolist() == [100, 101]
+    assert obs["layout_id"].tolist() == [200, 201]
+    assert obs["environment_seed"].tolist() == [300, 301]
+    assert obs["policy_seed"].tolist() == [3000, 3001]
+
+
+def test_non_auto_reset_env_stays_terminal_across_policy_chunks() -> None:
+    env = FakeBaseEnv(num_envs=2, terminate_env_ids=[0], auto_reset=False)
+
+    env.step(np.zeros((2, 2, 1), dtype=np.float32))
+    _, reward, terminated, truncated, success = env.step(np.zeros((2, 2, 1), dtype=np.float32))
+
+    assert env.step_calls == [[0, 1], [1], [1], [1]]
+    assert reward.tolist() == [[0.0, 0.0], [0.0, 0.0]]
+    assert terminated.tolist() == [[False, False], [False, False]]
+    assert truncated.tolist() == [[False, False], [False, False]]
+    assert success.tolist() == [[False, False], [False, False]]
+
+    env.reset(options={"env_idx": [0, 1]})
+    env.step(np.zeros((2, 1, 1), dtype=np.float32))
+    assert env.step_calls[-1] == [0, 1]
 
 
 def test_restart_episode_resets_without_marking_transition_done() -> None:

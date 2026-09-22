@@ -100,6 +100,12 @@ class AsyncRecorder(BaseRecorder):
         return self._run_sync("pop_completed")
 
     @override
+    def flush(self) -> None:
+        # This synchronous command is ordered after every queued record/save
+        # command, so returning from it is a recorder durability barrier.
+        self._run_sync("flush")
+
+    @override
     def finalize(self) -> None:
         if self._closed:
             return

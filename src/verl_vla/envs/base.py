@@ -36,6 +36,19 @@ from verl_vla.teleop import TeleopController
 from verl_vla.utils.envs.rate_limiter import pace_calls, reset_call_rate
 
 
+# These fields identify the immutable condition/policy draw for an episode and
+# must survive every action-chunk boundary.  Omitting ``suite_id`` made it
+# disappear after reset; trajectory collation then padded the missing values
+# with zero.  That was invisible for suite 0 but corrupted suite 1/2 groups.
+_EPISODE_IDENTITY_FIELDS = (
+    "suite_id",
+    "eval_episode_id",
+    "layout_id",
+    "environment_seed",
+    "policy_seed",
+)
+
+
 class BaseEnv(gym.Env):
     """Shared vector-env wrapper for teleop and recording.
 
@@ -257,6 +270,7 @@ class BaseEnv(gym.Env):
         critic_value: np.ndarray,
         chunk_started: bool,
     ) -> ExecutedStep:
+        done_before_step = self._execution_done.copy()
         if chunk_started:
             self._execution_chunk_intervened.fill(False)
 
@@ -277,6 +291,14 @@ class BaseEnv(gym.Env):
             "next.truncated": np.asarray(self._execution_merged_step_result["next.truncated"]).copy(),
             "next.success": np.asarray(self._execution_merged_step_result["next.success"]).copy(),
         }
+        if "next.score" in self._execution_merged_step_result:
+            feedback["next.score"] = np.asarray(self._execution_merged_step_result["next.score"]).copy()
+        # Envs that completed on an earlier low-level step are not valid
+        # transitions in the remainder of this serial action chunk.  Their
+        # merged result is retained for the final observation, but must not be
+        # repeated as feedback for every skipped tail step.
+        for value in feedback.values():
+            value[done_before_step] = 0
         return ExecutedStep(feedback=feedback)
 
     def _finish_execution_slice(self, steps) -> tuple[tuple[Any, ...], np.ndarray]:
@@ -284,6 +306,18 @@ class BaseEnv(gym.Env):
         terminated_steps = torch.stack([torch.as_tensor(step.feedback["next.terminated"]) for step in steps], dim=1)
         truncated_steps = torch.stack([torch.as_tensor(step.feedback["next.truncated"]) for step in steps], dim=1)
         success_steps = torch.stack([torch.as_tensor(step.feedback["next.success"]) for step in steps], dim=1)
+        score_steps = None
+        if steps and "next.score" in steps[0].feedback:
+            score_steps = torch.stack([torch.as_tensor(step.feedback["next.score"]) for step in steps], dim=1)
+
+        # Some simulator integrations can execute low-level controls without
+        # materializing camera observations after every control tick. Give
+        # them one explicit chunk-boundary hook before the result reaches the
+        # next policy call. Existing environments use the no-op default.
+        self._execution_merged_step_result = self.finalize_execution_observation(
+            self._execution_merged_step_result,
+            env_ids=np.arange(self.num_envs, dtype=np.int64),
+        )
 
         done_mask = (terminated_steps.bool() | truncated_steps.bool()).any(dim=1).numpy()
         reset_mask = done_mask | self._execution_restart_episode
@@ -299,13 +333,31 @@ class BaseEnv(gym.Env):
             "task": merged_step_result["task"],
             "task_id": merged_step_result["task_id"],
         }
-        if "eval_episode_id" in merged_step_result:
-            obs["eval_episode_id"] = merged_step_result["eval_episode_id"]
+        # Episode identity is observation metadata, not reset-only metadata.
+        # Keep it on every policy chunk so trajectory collation cannot pad a
+        # missing field with zeros and silently corrupt same-condition groups.
+        for field in _EPISODE_IDENTITY_FIELDS:
+            if field in merged_step_result:
+                obs[field] = merged_step_result[field]
 
         self._latest_obs = obs
         self._execution_restart_episode.fill(False)
-        self._execution_done.fill(False)
-        result = copy.deepcopy(obs), reward_steps, terminated_steps, truncated_steps, success_steps
+        # A non-auto-reset rollout represents one fixed episode.  Preserve its
+        # terminal state across later policy chunks so the backend is never
+        # stepped again before the env loop performs an explicit reset.
+        if self.auto_reset_enabled:
+            self._execution_done.fill(False)
+        if score_steps is None:
+            result = copy.deepcopy(obs), reward_steps, terminated_steps, truncated_steps, success_steps
+        else:
+            result = (
+                copy.deepcopy(obs),
+                reward_steps,
+                terminated_steps,
+                truncated_steps,
+                success_steps,
+                {"score": score_steps},
+            )
         return result, reset_mask
 
     def _async_execution_result(self, feedback_shape: tuple[int, int]) -> tuple[tuple[Any, ...], np.ndarray]:
@@ -322,13 +374,15 @@ class BaseEnv(gym.Env):
             "task": merged_step_result["task"],
             "task_id": merged_step_result["task_id"],
         }
-        if "eval_episode_id" in merged_step_result:
-            obs["eval_episode_id"] = merged_step_result["eval_episode_id"]
+        for field in _EPISODE_IDENTITY_FIELDS:
+            if field in merged_step_result:
+                obs[field] = merged_step_result[field]
 
         self._execution_merged_step_result = merged_step_result
         self._latest_obs = obs
         self._execution_restart_episode.fill(False)
-        self._execution_done.fill(False)
+        if self.auto_reset_enabled:
+            self._execution_done.fill(False)
         return (
             (
                 copy.deepcopy(obs),
@@ -399,6 +453,18 @@ class BaseEnv(gym.Env):
 
     def env_close(self) -> None:
         """Close subclass-owned simulator resources."""
+
+    def finalize_execution_observation(self, merged_step_result, *, env_ids):
+        """Materialize the observation returned at a serial chunk boundary.
+
+        Most environments already return a fresh observation from every
+        ``env_step`` and therefore use this no-op default. A simulator may
+        override this hook to defer expensive camera reads inside a policy
+        chunk while preserving per-control-step reward/done feedback.
+        """
+
+        del env_ids
+        return merged_step_result
 
     def env_benchmark_size(self) -> int:
         """Return the number of episodes in the environment's eval benchmark."""
@@ -526,7 +592,11 @@ class BaseEnv(gym.Env):
         if critic_value is None:
             critic_value = np.zeros(self.num_envs, dtype=np.float32)
         is_intervened = np.zeros(self.num_envs, dtype=bool)
-        done = np.zeros(self.num_envs, dtype=bool)
+        # Preserve per-env completion across the low-level steps of a serial
+        # action chunk.  This is required when vectorized envs finish at
+        # different times: completed envs must not be submitted to the backend
+        # again while their peers continue executing the same chunk.
+        done = np.asarray(self._execution_done, dtype=bool).copy()
         manual_reward = np.zeros(self.num_envs, dtype=np.float32)
         force_truncated = np.zeros(self.num_envs, dtype=bool)
         restart_episode = np.zeros(self.num_envs, dtype=bool)
@@ -591,7 +661,12 @@ class BaseEnv(gym.Env):
         terminations = self._to_numpy(step_result["next.terminated"])
         truncations = self._to_numpy(step_result["next.truncated"])
         successes = self._to_numpy(step_result["next.success"])
-        eval_episode_ids = self._to_numpy(step_result.get("eval_episode_id"))
+        scores = self._to_numpy(step_result.get("next.score"))
+        episode_identity = {
+            field: self._to_numpy(step_result.get(field))
+            for field in _EPISODE_IDENTITY_FIELDS
+            if step_result.get(field) is not None
+        }
         if merged_step_result is None:
             merged_step_result = {
                 "observation": [None] * self.num_envs,
@@ -602,8 +677,16 @@ class BaseEnv(gym.Env):
                 "next.truncated": np.empty(self.num_envs, dtype=bool),
                 "next.success": np.empty(self.num_envs, dtype=bool),
             }
-            if eval_episode_ids is not None:
-                merged_step_result["eval_episode_id"] = np.empty(self.num_envs, dtype=eval_episode_ids.dtype)
+            if scores is not None:
+                merged_step_result["next.score"] = np.empty(self.num_envs, dtype=scores.dtype)
+            for field, values in episode_identity.items():
+                merged_step_result[field] = np.empty(self.num_envs, dtype=values.dtype)
+
+        for field, values in episode_identity.items():
+            if field not in merged_step_result:
+                merged_step_result[field] = np.empty(self.num_envs, dtype=values.dtype)
+        if scores is not None and "next.score" not in merged_step_result:
+            merged_step_result["next.score"] = np.empty(self.num_envs, dtype=scores.dtype)
 
         for local_id, env_id in enumerate(env_ids):
             env_id = int(env_id)
@@ -614,8 +697,10 @@ class BaseEnv(gym.Env):
             merged_step_result["next.terminated"][env_id] = terminations[local_id]
             merged_step_result["next.truncated"][env_id] = truncations[local_id]
             merged_step_result["next.success"][env_id] = successes[local_id]
-            if eval_episode_ids is not None:
-                merged_step_result["eval_episode_id"][env_id] = eval_episode_ids[local_id]
+            if scores is not None:
+                merged_step_result["next.score"][env_id] = scores[local_id]
+            for field, values in episode_identity.items():
+                merged_step_result[field][env_id] = values[local_id]
 
         return merged_step_result
 
@@ -630,7 +715,7 @@ class BaseEnv(gym.Env):
         reset_obs = self.env_reset(
             env_ids=env_ids[reset_local_ids],
         )
-        for key in ("observation", "task", "task_id", "eval_episode_id"):
+        for key in ("observation", "task", "task_id", *_EPISODE_IDENTITY_FIELDS):
             if key not in step_result or key not in reset_obs:
                 continue
             for reset_idx, local_id in enumerate(reset_local_ids):
@@ -648,8 +733,9 @@ class BaseEnv(gym.Env):
             "task": [self._latest_obs["task"][env_id] for env_id in env_ids],
             "task_id": [self._latest_obs["task_id"][env_id] for env_id in env_ids],
         }
-        if "eval_episode_id" in self._latest_obs:
-            current_obs["eval_episode_id"] = [self._latest_obs["eval_episode_id"][env_id] for env_id in env_ids]
+        for field in _EPISODE_IDENTITY_FIELDS:
+            if field in self._latest_obs:
+                current_obs[field] = [self._latest_obs[field][env_id] for env_id in env_ids]
         return current_obs
 
     def _update_latest_obs(self, env_ids, step_result) -> None:
@@ -658,8 +744,9 @@ class BaseEnv(gym.Env):
             self._latest_obs["observation"][env_id] = step_result["observation"][local_id]
             self._latest_obs["task"][env_id] = step_result["task"][local_id]
             self._latest_obs["task_id"][env_id] = step_result["task_id"][local_id]
-            if "eval_episode_id" in step_result and "eval_episode_id" in self._latest_obs:
-                self._latest_obs["eval_episode_id"][env_id] = step_result["eval_episode_id"][local_id]
+            for field in _EPISODE_IDENTITY_FIELDS:
+                if field in step_result and field in self._latest_obs:
+                    self._latest_obs[field][env_id] = step_result[field][local_id]
 
     @staticmethod
     def _to_numpy(value, *, copy: bool = False):
@@ -886,6 +973,10 @@ class BaseEnv(gym.Env):
             if not self._recorder_episode_done[env_id]:
                 self.recorder.save_episode(env_id)
                 self._recorder_episode_done[env_id] = True
+        # Eval may return while Ray keeps the EnvWorker alive; close_recorder()
+        # is therefore not a reliable synchronization point. Ensure every
+        # queued save is durable before metrics consumers index the videos.
+        self.recorder.flush()
 
     def close_recorder(self) -> None:
         if self.recorder is None:

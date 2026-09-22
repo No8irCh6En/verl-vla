@@ -28,6 +28,10 @@ from verl.utils.device import get_torch_device
 logger = logging.getLogger(__name__)
 
 
+class SimulatorCommandTimeoutError(TimeoutError):
+    """Raised when a live simulator subprocess does not answer an RPC in time."""
+
+
 def cleanup_device_tensors():
     gc.collect()
     torch_device = get_torch_device()
@@ -171,6 +175,7 @@ class EnvManager:
         self.command_queue: Optional[mp.Queue] = None
         self.result_queue: Optional[mp.Queue] = None
         self.state_buffer: Optional[bytes] = None
+        self.cold_start_pending = False
 
         self.env_cls = env_cls
 
@@ -231,6 +236,10 @@ class EnvManager:
                     ) from None
         if result["status"] != "ready":
             raise RuntimeError(f"Simulator initialization failed: {result}")
+        # RoboDojo lazily builds the actual scene during reset.  Track that
+        # boundary in the parent so EnvWorker can stagger only expensive cold
+        # resets, without serializing normal steady-state resets.
+        self.cold_start_pending = True
 
     def stop_simulator(self):
         if not self.process:
@@ -259,6 +268,96 @@ class EnvManager:
 
         self.process = None
 
+    def force_stop_simulator(self) -> None:
+        """Stop an unresponsive subprocess without requesting adapter state.
+
+        ``state_buffer`` is deliberately preserved.  A normal restart saves the
+        deterministic case cursors before launching the child; if a later reset
+        RPC hangs, the replacement child must reload that last known-good state
+        and retry the same case rather than advancing the schedule.
+        """
+
+        process = self.process
+        if process is not None and process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+            if process.is_alive():
+                kill = getattr(process, "kill", None)
+                if callable(kill):
+                    kill()
+                process.join(timeout=10)
+
+        for command_queue in (self.command_queue, self.result_queue):
+            if command_queue is None:
+                continue
+            try:
+                command_queue.cancel_join_thread()
+            except (AttributeError, OSError, ValueError):
+                pass
+            try:
+                command_queue.close()
+            except (OSError, ValueError):
+                pass
+
+        self.command_queue = None
+        self.result_queue = None
+        self.process = None
+
+    def call(self, name, *args, timeout_s: float | None = None, **kwargs):
+        """Invoke one simulator method, optionally with a bounded response wait."""
+
+        if self.process is None or not self.process.is_alive():
+            raise RuntimeError("Simulator not running")
+        if timeout_s is not None and timeout_s <= 0:
+            raise ValueError(f"timeout_s must be positive when set, got {timeout_s}")
+
+        args = recursive_to_own(args)
+        kwargs = recursive_to_own(kwargs)
+        self.command_queue.put({"method": name, "args": args, "kwargs": kwargs})
+
+        deadline = None if timeout_s is None else time.monotonic() + float(timeout_s)
+        while True:
+            wait_s = 1.0
+            if deadline is not None:
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0:
+                    raise SimulatorCommandTimeoutError(
+                        f"Simulator RPC {name!r} timed out after {timeout_s}s "
+                        f"(rank={self.rank}, stage_id={self.stage_id}, pid={self.process.pid})."
+                    )
+                wait_s = min(wait_s, remaining_s)
+            try:
+                result = self.result_queue.get(timeout=wait_s)
+                break
+            except queue.Empty:
+                if self.process is None or not self.process.is_alive():
+                    exitcode = None if self.process is None else self.process.exitcode
+                    raise RuntimeError(
+                        f"Simulator exited while handling RPC {name!r} "
+                        f"(rank={self.rank}, stage_id={self.stage_id}, exitcode={exitcode})."
+                    ) from None
+
+        result = recursive_to_own(result)
+        if result["status"] == "error":
+            raise RuntimeError(result["error"])
+        if name == "reset":
+            self.cold_start_pending = False
+        return result["data"]
+
+    def snapshot_state(self, *, timeout_s: float = 30.0):
+        """Persist the latest adapter state for a future forced restart.
+
+        A normal simulator restart snapshots state before shutting down.  A
+        recovery restart, however, can happen after several successful reset
+        calls (notably while switching between train and evaluation).  Keep
+        the recovery point current after those calls so a later timeout cannot
+        roll deterministic case cursors back to an older reset wave.
+        """
+
+        state = self.call("get_state", timeout_s=timeout_s)
+        self.state_buffer = state
+        return state
+
     def __getattr__(self, name):
         if name in [
             "cfg",
@@ -274,22 +373,12 @@ class EnvManager:
             "env_cls",
             "context",
             "start_timeout_s",
+            "cold_start_pending",
         ]:
             return super().__getattr__(name)
 
         def method_proxy(*args, **kwargs):
-            if self.process is None or not self.process.is_alive():
-                raise RuntimeError("Simulator not running")
-
-            args = recursive_to_own(args)
-            kwargs = recursive_to_own(kwargs)
-            self.command_queue.put({"method": name, "args": args, "kwargs": kwargs})
-
-            result = self.result_queue.get()
-            result = recursive_to_own(result)
-            if result["status"] == "error":
-                raise Exception(result["error"])
-            return result["data"]
+            return self.call(name, *args, **kwargs)
 
         return method_proxy
 
@@ -309,6 +398,7 @@ class EnvManager:
             "env_cls",
             "context",
             "start_timeout_s",
+            "cold_start_pending",
         ]:
             super().__setattr__(name, value)
             return

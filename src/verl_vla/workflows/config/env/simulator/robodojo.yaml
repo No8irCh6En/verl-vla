@@ -1,0 +1,22 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+
+_target_: verl_vla.envs.robodojo.config.RoboDojoSimulatorConfig
+simulator_type: robodojo
+robodojo_root: ???
+task_name: stack_bowls
+task_names: []
+task_id: 0
+worker_stage_task_schedule: []
+env_cfg_type: arx_x5
+action_type: joint
+device_id: 0
+headless: true
+layout_ids: [0, 1, 2, 3, 4, 5]
+eval_num: 1
+seed: 0
+reset_rpc_timeout_s: 240
+reset_process_max_restarts: 2
+restart_between_rollouts: false
+parallel_restart_stages: false

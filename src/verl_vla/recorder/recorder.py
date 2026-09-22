@@ -137,6 +137,11 @@ class MultiRecorder(BaseRecorder):
         return None
 
     @override
+    def flush(self) -> None:
+        for recorder in self.recorders:
+            recorder.flush()
+
+    @override
     def finalize(self) -> None:
         for recorder in self.recorders:
             recorder.finalize()

@@ -1,0 +1,38 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+
+# Native Fast-WAM adapter configuration. Machine-local paths are supplied by
+# the deployment recipe rather than committed into the framework package.
+policy_root: ???
+checkpoint_sha256: 38d38afac480e151c4df079dbf4e869d3b45f3a023f862215a7baaa689af4db0
+weights_relative_path: checkpoints/weights/step_020000.pt
+dataset_stats_relative_path: dataset_stats.json
+action_horizon: 32
+action_chunk_size: 24
+num_inference_steps: 10
+# Continuous-flow rollout exploration. This scales only the initial action
+# latent sampled for policy inference; it does not alter FPO fixed-MC noise.
+rollout_action_latent_scale: 1.0
+# `episode` preserves the historical behavior. `per_policy_call` derives a
+# deterministic fresh seed for each replanning call of each policy_seed.
+rollout_seed_mode: episode
+sigma_shift: null
+seed: 0
+text_cfg_scale: 1.0
+negative_prompt: ""
+rand_device: cpu
+tiled: false
+sim_cfg_name: sim_robotwin.yaml
+sim_task: robotwin_uncond_3cam_384_1e-4
+
+# Vanilla Flow Policy Optimization additions. The native Fast-WAM checkpoint
+# remains unchanged; these parameters live in the full verl checkpoint.
+fpo:
+  enabled: false
+  value_enabled: false
+
+flow_grpo:
+  enabled: false
+  noise_level: 0.01
+  transition_batch_size: 1

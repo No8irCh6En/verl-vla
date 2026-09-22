@@ -189,6 +189,26 @@ class SupportFPOTraining:
         raise NotImplementedError("Subclasses must implement fpo_get_value_parameters method.")
 
 
+class SupportFlowGRPOTraining:
+    """Model contract for transition-likelihood Flow-GRPO training."""
+
+    def flow_grpo_init(self) -> None:
+        raise NotImplementedError("Subclasses must implement flow_grpo_init method.")
+
+    def flow_grpo_log_probs(
+        self,
+        obs: DataProto,
+        tokenizer: torch.nn.Module,
+        latents: torch.Tensor,
+        sigmas: torch.Tensor,
+        deltas: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate recorded stochastic flow transitions under the actor."""
+
+        del obs, tokenizer, latents, sigmas, deltas
+        raise NotImplementedError("Subclasses must implement flow_grpo_log_probs method.")
+
+
 class SupportSFTTraining:
     """
     Base class for models that expose one unified SFT loss interface.
